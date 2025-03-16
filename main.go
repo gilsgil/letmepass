@@ -42,6 +42,7 @@ type Payload struct {
 	ExtraHeaders map[string]string
 	Method       string
 	ExtraInfo    string
+	Data         string // novo campo para dados (body)
 }
 
 // Config holds user-provided settings.
@@ -85,6 +86,9 @@ func main() {
 	output := flag.String("o", "", "Arquivo de saída (opcional)")
 	verbose := flag.Bool("v", false, "Modo verbose: mostra resultados em tempo real")
 	allFlag := flag.Bool("all", false, "Testa todas as URLs mesmo que o check inicial não retorne 401/403")
+	// Novos flags:
+	methodFlag := flag.String("X", "", "Método HTTP a ser utilizado (ex: GET, POST, PUT, etc.)")
+	dataFlag := flag.String("d", "", "Dados a enviar na requisição (JSON ou form-data)")
 	flag.Parse()
 
 	// Build the Config
@@ -136,6 +140,18 @@ func main() {
 	if len(allPayloads) == 0 {
 		fmt.Println("Nenhuma requisição gerada. Verifique suas URLs ou técnicas.")
 		os.Exit(0)
+	}
+
+	// Se o usuário passou -X ou -d, sobrescreve o método e adiciona os dados em todos os payloads
+	if *methodFlag != "" || *dataFlag != "" {
+		for i := range allPayloads {
+			if *methodFlag != "" {
+				allPayloads[i].Method = *methodFlag
+			}
+			if *dataFlag != "" {
+				allPayloads[i].Data = *dataFlag
+			}
+		}
 	}
 
 	// Executa os testes com concorrência
@@ -281,10 +297,23 @@ func runTests(payloads []Payload, config Config) []Response {
 			if method == "" {
 				method = "GET"
 			}
-			req, err := http.NewRequest(method, pl.URL, nil)
+			var body io.Reader = nil
+			if pl.Data != "" {
+				body = strings.NewReader(pl.Data)
+			}
+			req, err := http.NewRequest(method, pl.URL, body)
 			if err != nil {
 				resultsChan <- Response{URL: pl.URL, StatusCode: 0, BodyLength: 0, ExtraInfo: pl.ExtraInfo}
 				return
+			}
+			// Se dados foram enviados e não há Content-Type, define automaticamente
+			if pl.Data != "" && req.Header.Get("Content-Type") == "" {
+				trimmed := strings.TrimSpace(pl.Data)
+				if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+					req.Header.Set("Content-Type", "application/json")
+				} else {
+					req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				}
 			}
 			// Cabeçalhos padrão
 			req.Header.Set("User-Agent", "Mozilla/5.0")
@@ -306,7 +335,7 @@ func runTests(payloads []Payload, config Config) []Response {
 				return
 			}
 			defer resp.Body.Close()
-			body, err := io.ReadAll(resp.Body)
+			bodyBytes, err := io.ReadAll(resp.Body)
 			if err != nil {
 				resultsChan <- Response{URL: pl.URL, StatusCode: 0, BodyLength: 0, ExtraInfo: pl.ExtraInfo}
 				return
@@ -314,7 +343,7 @@ func runTests(payloads []Payload, config Config) []Response {
 			resultsChan <- Response{
 				URL:        pl.URL,
 				StatusCode: resp.StatusCode,
-				BodyLength: len(body),
+				BodyLength: len(bodyBytes),
 				ExtraInfo:  pl.ExtraInfo,
 			}
 		}(p)
@@ -397,7 +426,7 @@ func generateDDSPayloads(parsedURL *url.URL, layer int, full bool) []string {
 		"%26", "%23", "%2c", "%7c", "%2e%2e%2f%2e%2e%2f",
 		"%2f..%2f..", "%5c..%5c..", "....//", "..//..", "....//..//..",
 		"./..//", "%u221e", "%u002e%u002e", "....", "..%2e/",
-		".%00./", ".%0d./", ".%0a./", ".%2e./", ".%2f./", ".\\/",
+		".%00./", ".%0d./", ".%0a./", ".%2e./", ".%2f./", ".\\/ ",
 		"%u2215", "%uff0f", "%c0%af", "%252f", "%5c", "%2f",
 		"..\\.\\", "....\\", "..\\..\\",
 	}
