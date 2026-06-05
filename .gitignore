@@ -1,0 +1,5 @@
+# IDE / editor local config
+.claude/
+
+# Build output
+letmepass
